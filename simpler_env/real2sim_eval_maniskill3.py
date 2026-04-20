@@ -50,10 +50,22 @@ class Args:
     """The directory to save videos and results"""
 
     model: Optional[str] = None
-    """The model to evaluate on the given environment. Can be one of octo-base, octo-small, rt-1x. If not given, random actions are sampled."""
+    """The model to evaluate on the given environment. Can be one of octo-base, octo-small, rt-1x, praxis-remote. If not given, random actions are sampled."""
 
     ckpt_path: str = ""
     """Checkpoint path for models. Only used for RT models"""
+
+    praxis_host: str = "127.0.0.1"
+    """Host for the Praxis gRPC policy server when --model=praxis-remote."""
+
+    praxis_port: int = 50051
+    """Port for the Praxis gRPC policy server when --model=praxis-remote."""
+
+    praxis_policy_setup: str = "widowx_bridge"
+    """SIMPLER policy setup string to pass to the Praxis remote wrapper."""
+
+    praxis_action_scale: float = 1.0
+    """Action scale to apply inside the Praxis remote wrapper."""
 
     seed: Annotated[int, tyro.conf.arg(aliases=["-s"])] = 0
     """Seed the model and environment. Default seed is 0"""
@@ -95,6 +107,7 @@ def main():
         else:
             from simpler_env.policies.rt1.rt1_model import RT1Inference
             from simpler_env.policies.octo.octo_model import OctoInference
+            from simpler_env.policies.praxis import PraxisRemoteInference
             if args.model == "octo-base" or args.model == "octo-small":
                 model = OctoInference(model_type=args.model, policy_setup=policy_setup, init_rng=args.seed, action_scale=1)
             elif args.model == "rt-1x":
@@ -103,6 +116,13 @@ def main():
                     saved_model_path=ckpt_path,
                     policy_setup=policy_setup,
                     action_scale=1,
+                )
+            elif args.model == "praxis-remote":
+                model = PraxisRemoteInference(
+                    host=args.praxis_host,
+                    port=args.praxis_port,
+                    policy_setup=args.praxis_policy_setup,
+                    action_scale=args.praxis_action_scale,
                 )
             elif args.model is not None:
                 raise ValueError(f"Model {args.model} does not exist / is not supported.")
@@ -121,6 +141,11 @@ def main():
 
     print(f"Running Real2Sim Evaluation of model {args.model} on environment {args.env_id}")
     print(f"Using {args.num_envs} environments on the {sim_backend} simulation backend")
+    if model is not None and hasattr(model, "health_check"):
+        ready, info = model.health_check()
+        print(f"model health_check ready={ready} info={info}")
+        if not ready:
+            raise RuntimeError(f"Policy model {args.model} is not ready: {info}")
 
     timers = {"env.step+inference": 0, "env.step": 0, "inference": 0, "total": 0}
     total_start_time = time.time()
@@ -187,6 +212,8 @@ def main():
     with open(metrics_path, "w") as f:
         json.dump(mean_metrics, f, indent=4)
     print(f"Evaluation complete. Results saved to {exp_dir}. Metrics saved to {metrics_path}")
+    if model is not None and hasattr(model, "close"):
+        model.close()
 
 if __name__ == "__main__":
     main()
