@@ -29,11 +29,11 @@ class PraxisRemoteInference:
         policy_kwargs: Mapping[str, Any] | None = None,
     ) -> None:
         try:
-            from praxis.serving.client import PolicyClient
+            from praxis_client import PolicyClient
         except ImportError as exc:  # pragma: no cover - import failure is user setup.
             raise ImportError(
-                "PraxisRemoteInference requires the Praxis repo to be importable. "
-                "Install Praxis or add it to PYTHONPATH before using this wrapper."
+                "PraxisRemoteInference requires praxis_client to be importable. "
+                "Install the Praxis client package before using this wrapper."
             ) from exc
 
         self.client = PolicyClient(host=host, port=int(port))

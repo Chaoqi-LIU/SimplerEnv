@@ -2,6 +2,7 @@ from collections import defaultdict
 import json
 import os
 import signal
+import sys
 import time
 import numpy as np
 from typing import Annotated, Optional
@@ -21,6 +22,21 @@ from mani_skill.envs.sapien_env import BaseEnv
 import tyro
 from dataclasses import dataclass
 from pathlib import Path
+
+
+def _get_env_device(env) -> torch.device:
+    if hasattr(env, "device"):
+        return env.device
+
+    unwrapped = getattr(env, "unwrapped", None)
+    if unwrapped is not None and hasattr(unwrapped, "device"):
+        return unwrapped.device
+
+    raise AttributeError(
+        "Environment does not expose a .device attribute on either the wrapper "
+        "or env.unwrapped."
+    )
+
 
 @dataclass
 class Args:
@@ -95,7 +111,8 @@ def main():
         num_envs=args.num_envs,
         sensor_configs=sensor_configs
     )
-    sim_backend = 'gpu' if env.device.type == 'cuda' else 'cpu'
+    env_device = _get_env_device(env)
+    sim_backend = 'gpu' if env_device.type == 'cuda' else 'cpu'
 
     # Setup up the policy inference model
     model = None
@@ -105,12 +122,13 @@ def main():
         if args.model is None:
             pass
         else:
-            from simpler_env.policies.rt1.rt1_model import RT1Inference
-            from simpler_env.policies.octo.octo_model import OctoInference
-            from simpler_env.policies.praxis import PraxisRemoteInference
             if args.model == "octo-base" or args.model == "octo-small":
+                from simpler_env.policies.octo.octo_model import OctoInference
+
                 model = OctoInference(model_type=args.model, policy_setup=policy_setup, init_rng=args.seed, action_scale=1)
             elif args.model == "rt-1x":
+                from simpler_env.policies.rt1.rt1_model import RT1Inference
+
                 ckpt_path=args.ckpt_path
                 model = RT1Inference(
                     saved_model_path=ckpt_path,
@@ -118,6 +136,8 @@ def main():
                     action_scale=1,
                 )
             elif args.model == "praxis-remote":
+                from simpler_env.policies.praxis import PraxisRemoteInference
+
                 model = PraxisRemoteInference(
                     host=args.praxis_host,
                     port=args.praxis_port,
@@ -214,6 +234,12 @@ def main():
     print(f"Evaluation complete. Results saved to {exp_dir}. Metrics saved to {metrics_path}")
     if model is not None and hasattr(model, "close"):
         model.close()
+    env.close()
 
 if __name__ == "__main__":
     main()
+    # Some cluster SAPIEN/ManiSkill stacks finish evaluation successfully but
+    # crash during interpreter teardown; hard-exit once results are flushed.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
