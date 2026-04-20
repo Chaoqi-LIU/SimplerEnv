@@ -24,6 +24,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+def _make_env(*, env_id: str, num_envs: int, shader: str) -> BaseEnv:
+    sensor_configs = {"shader_pack": shader}
+    return gym.make(
+        env_id,
+        obs_mode="rgb+segmentation",
+        num_envs=num_envs,
+        sensor_configs=sensor_configs,
+    )
+
+
 def _get_env_device(env) -> torch.device:
     if hasattr(env, "device"):
         return env.device
@@ -65,6 +75,9 @@ class Args:
     record_dir: str = "videos"
     """The directory to save videos and results"""
 
+    metrics_output_path: Optional[str] = None
+    """Optional explicit JSON output path for aggregated metrics."""
+
     model: Optional[str] = None
     """The model to evaluate on the given environment. Can be one of octo-base, octo-small, rt-1x, praxis-remote. If not given, random actions are sampled."""
 
@@ -83,6 +96,9 @@ class Args:
     praxis_action_scale: float = 1.0
     """Action scale to apply inside the Praxis remote wrapper."""
 
+    praxis_policy_kwargs_json: str = ""
+    """Optional JSON object of kwargs to forward through Praxis remote predict_action."""
+
     seed: Annotated[int, tyro.conf.arg(aliases=["-s"])] = 0
     """Seed the model and environment. Default seed is 0"""
 
@@ -95,6 +111,9 @@ class Args:
     save_video: bool = True
     """Whether to save videos"""
 
+    max_videos: int = 0
+    """Maximum number of episode videos to save (0 = save all when save_video is true)."""
+
     debug: bool = False
 
 def main():
@@ -102,22 +121,9 @@ def main():
     if args.seed is not None:
         np.random.seed(args.seed)
 
-
-    sensor_configs = dict()
-    sensor_configs["shader_pack"] = args.shader
-    env: BaseEnv = gym.make(
-        args.env_id,
-        obs_mode="rgb+segmentation",
-        num_envs=args.num_envs,
-        sensor_configs=sensor_configs
-    )
-    env_device = _get_env_device(env)
-    sim_backend = 'gpu' if env_device.type == 'cuda' else 'cpu'
-
     # Setup up the policy inference model
     model = None
     try:
-
         policy_setup = "widowx_bridge"
         if args.model is None:
             pass
@@ -138,11 +144,21 @@ def main():
             elif args.model == "praxis-remote":
                 from simpler_env.policies.praxis import PraxisRemoteInference
 
+                policy_kwargs = (
+                    json.loads(args.praxis_policy_kwargs_json)
+                    if args.praxis_policy_kwargs_json
+                    else None
+                )
+                if policy_kwargs is not None and not isinstance(policy_kwargs, dict):
+                    raise ValueError(
+                        "--praxis-policy-kwargs-json must decode to a JSON object."
+                    )
                 model = PraxisRemoteInference(
                     host=args.praxis_host,
                     port=args.praxis_port,
                     policy_setup=args.praxis_policy_setup,
                     action_scale=args.praxis_action_scale,
+                    policy_kwargs=policy_kwargs,
                 )
             elif args.model is not None:
                 raise ValueError(f"Model {args.model} does not exist / is not supported.")
@@ -158,9 +174,15 @@ def main():
 
     eval_metrics = defaultdict(list)
     eps_count = 0
+    episode_sum_rewards: list[float] = []
+    episode_max_rewards: list[float] = []
+    episode_lengths: list[int] = []
+    sim_backend = None
+    videos_saved = 0
+    env: BaseEnv | None = None
+    current_num_envs = 0
 
     print(f"Running Real2Sim Evaluation of model {args.model} on environment {args.env_id}")
-    print(f"Using {args.num_envs} environments on the {sim_backend} simulation backend")
     if model is not None and hasattr(model, "health_check"):
         ready, info = model.health_check()
         print(f"model health_check ready={ready} info={info}")
@@ -171,8 +193,28 @@ def main():
     total_start_time = time.time()
     
     while eps_count < args.num_episodes:
+        remaining_episodes = int(args.num_episodes - eps_count)
+        batch_num_envs = min(int(args.num_envs), remaining_episodes)
+        if env is None or current_num_envs != batch_num_envs:
+            if env is not None:
+                env.close()
+            env = _make_env(
+                env_id=args.env_id,
+                num_envs=batch_num_envs,
+                shader=args.shader,
+            )
+            current_num_envs = batch_num_envs
+            env_device = _get_env_device(env)
+            sim_backend = "gpu" if env_device.type == "cuda" else "cpu"
+            print(
+                f"Using {batch_num_envs} environments on the {sim_backend} simulation backend"
+            )
+
         seed = args.seed + eps_count
-        obs, _ = env.reset(seed=seed, options={"episode_id": torch.tensor([seed + i for i in range(args.num_envs)])})
+        obs, _ = env.reset(
+            seed=seed,
+            options={"episode_id": torch.tensor([seed + i for i in range(batch_num_envs)])},
+        )
         instruction = env.unwrapped.get_language_instruction()
         print("instruction:", instruction[0])
         if model is not None:
@@ -181,6 +223,8 @@ def main():
         predicted_terminated, truncated = False, False
         images.append(get_image_from_maniskill3_obs_dict(env, obs))
         elapsed_steps = 0
+        sum_rewards_this_episode = np.zeros(batch_num_envs, dtype=np.float64)
+        max_rewards_this_episode = np.full(batch_num_envs, -np.inf, dtype=np.float64)
         while not (predicted_terminated or truncated):
             if model is not None:
                 start_time = time.time()
@@ -199,6 +243,9 @@ def main():
             obs, reward, terminated, truncated, info = env.step(action)
             timers["env.step"] += time.time() - start_time
             elapsed_steps += 1
+            reward_np = common.to_numpy(reward).reshape(-1)
+            sum_rewards_this_episode += reward_np
+            max_rewards_this_episode = np.maximum(max_rewards_this_episode, reward_np)
             info = common.to_numpy(info)
             
             truncated = bool(truncated.any()) # note that all envs truncate and terminate at the same time.
@@ -206,35 +253,53 @@ def main():
 
         for k, v in info.items():
             eval_metrics[k].append(v.flatten())
+        episode_sum_rewards.extend(float(value) for value in sum_rewards_this_episode)
+        episode_max_rewards.extend(float(value) for value in max_rewards_this_episode)
+        episode_lengths.extend([elapsed_steps] * batch_num_envs)
         if args.save_video:
             for i in range(len(images[-1])):
+                if args.max_videos > 0 and videos_saved >= args.max_videos:
+                    break
                 images_to_video([img[i].cpu().numpy() for img in images], exp_dir, f"{sim_backend}_eval_{seed + i}_success={info['success'][i].item()}", fps=10, verbose=True)
-        eps_count += args.num_envs
-        if args.num_envs == 1:
+                videos_saved += 1
+        eps_count += batch_num_envs
+        if batch_num_envs == 1:
             print(f"Evaluated episode {eps_count}. Seed {seed}. Results after {eps_count} episodes:")
         else:
-            print(f"Evaluated {args.num_envs} episodes, seeds {seed} to {eps_count}. Results after {eps_count} episodes:")
+            print(f"Evaluated {batch_num_envs} episodes, seeds {seed} to {eps_count}. Results after {eps_count} episodes:")
         for k, v in eval_metrics.items():
             print(f"{k}: {np.mean(v)}")
     # Print timing information
     timers["total"] = time.time() - total_start_time
     timers["env.step+inference"] = timers["env.step"] + timers["inference"]
     mean_metrics = {k: np.mean(v) for k, v in eval_metrics.items()}
-    mean_metrics["total_episodes"] = eps_count
+    mean_metrics["n_episodes"] = int(eps_count)
+    mean_metrics["total_episodes"] = int(eps_count)
+    mean_metrics["success_rate"] = float(np.mean(eval_metrics["success"])) if "success" in eval_metrics else 0.0
+    mean_metrics["avg_episode_length"] = float(np.mean(episode_lengths)) if episode_lengths else 0.0
+    mean_metrics["avg_reward"] = float(np.mean(episode_sum_rewards)) if episode_sum_rewards else 0.0
+    mean_metrics["avg_sum_reward"] = mean_metrics["avg_reward"]
+    mean_metrics["avg_max_reward"] = float(np.mean(episode_max_rewards)) if episode_max_rewards else 0.0
+    mean_metrics["eval_s"] = float(timers["total"])
+    mean_metrics["eval_ep_s"] = float(timers["total"]) / max(1, eps_count)
     mean_metrics["time/episodes_per_second"] = eps_count / timers["total"]
     print("Timing Info:")
     for key, value in timers.items():
         mean_metrics[f"time/{key}"] = value
         print(f"{key}: {value:.2f} seconds")
-    metrics_path = os.path.join(exp_dir, f"{sim_backend}_eval_metrics.json")
-    if sim_backend == "gpu":
-        metrics_path = metrics_path.replace("gpu", f"gpu_{args.num_envs}_envs")
+    metrics_path = args.metrics_output_path
+    if metrics_path is None:
+        metrics_path = os.path.join(exp_dir, f"{sim_backend}_eval_metrics.json")
+        if sim_backend == "gpu":
+            metrics_path = metrics_path.replace("gpu", f"gpu_{args.num_envs}_envs")
+    Path(metrics_path).parent.mkdir(parents=True, exist_ok=True)
     with open(metrics_path, "w") as f:
         json.dump(mean_metrics, f, indent=4)
     print(f"Evaluation complete. Results saved to {exp_dir}. Metrics saved to {metrics_path}")
     if model is not None and hasattr(model, "close"):
         model.close()
-    env.close()
+    if env is not None:
+        env.close()
 
 if __name__ == "__main__":
     main()
