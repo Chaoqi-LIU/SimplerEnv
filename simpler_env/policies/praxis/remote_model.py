@@ -44,7 +44,10 @@ class PraxisRemoteInference:
         self.image_key_map = {"image": primary_image_key}
         if additional_image_keys is not None:
             self.image_key_map.update(
-                {str(local_key): str(remote_key) for local_key, remote_key in additional_image_keys.items()}
+                {
+                    str(local_key): str(remote_key)
+                    for local_key, remote_key in additional_image_keys.items()
+                }
             )
         self.policy_kwargs = dict(policy_kwargs or {})
         self.task = None
@@ -130,10 +133,16 @@ class PraxisRemoteInference:
             if action_rows
             else np.zeros((0, 7), dtype=np.float32)
         )
-        preview = _to_numpy(images[-1]) if images else np.zeros((32, 32, 3), dtype=np.uint8)
+        preview = (
+            _to_numpy(images[-1]) if images else np.zeros((32, 32, 3), dtype=np.uint8)
+        )
         if preview.ndim == 4:
             preview = preview[0]
-        if preview.ndim == 3 and preview.shape[0] in {1, 3, 4} and preview.shape[-1] not in {3, 4}:
+        if (
+            preview.ndim == 3
+            and preview.shape[0] in {1, 3, 4}
+            and preview.shape[-1] not in {3, 4}
+        ):
             preview = np.moveaxis(preview, 0, -1)
         if preview.ndim == 3 and preview.shape[-1] == 4:
             preview = preview[..., :3]
@@ -240,26 +249,46 @@ class PraxisRemoteInference:
         *,
         return_device: Any,
     ) -> tuple[dict[str, np.ndarray | Any], dict[str, np.ndarray | Any]]:
+        action = np.asarray(action, dtype=np.float32)
+        if action.ndim not in {1, 2} or action.shape[-1] != 7:
+            raise ValueError(
+                f"Expected Bridge action shape (7,) or (B, 7), got {action.shape}."
+            )
         if action.ndim == 1:
             world_vector = action[:3] * self.action_scale
-            rot_axangle = action[3:6] * self.action_scale
+            rotation_delta = action[3:6]
             gripper = action[6:7]
             terminate_episode = np.zeros((1,), dtype=np.float32)
         else:
             world_vector = action[:, :3] * self.action_scale
-            rot_axangle = action[:, 3:6] * self.action_scale
+            rotation_delta = action[:, 3:6]
             gripper = action[:, 6:7]
             terminate_episode = np.zeros((action.shape[0], 1), dtype=np.float32)
+
+        rotation_delta = rotation_delta.astype(np.float32, copy=False)
+        rotation_delta = rotation_delta * self.action_scale
+
+        if self.policy_setup == "widowx_bridge":
+            gripper = np.where(gripper > 0.5, 1.0, -1.0).astype(
+                np.float32,
+                copy=False,
+            )
 
         raw_action = {
             "action": _maybe_to_torch(action, return_device=return_device),
             "world_vector": _maybe_to_torch(world_vector, return_device=return_device),
-            "rot_axangle": _maybe_to_torch(rot_axangle, return_device=return_device),
+            "rotation_delta": _maybe_to_torch(
+                rotation_delta,
+                return_device=return_device,
+            ),
             "gripper": _maybe_to_torch(gripper, return_device=return_device),
         }
         env_action = {
             "world_vector": _maybe_to_torch(world_vector, return_device=return_device),
-            "rot_axangle": _maybe_to_torch(rot_axangle, return_device=return_device),
+            "rotation_delta": _maybe_to_torch(
+                rotation_delta,
+                return_device=return_device,
+            ),
             "gripper": _maybe_to_torch(gripper, return_device=return_device),
             "terminate_episode": _maybe_to_torch(
                 terminate_episode,
@@ -289,7 +318,8 @@ def _prepare_image_array(image: np.ndarray | Any) -> np.ndarray:
         )
 
     if np.issubdtype(array.dtype, np.integer):
-        array = array.astype(np.float32) / 255.0
+        if array.dtype != np.uint8:
+            array = np.clip(array, 0, 255).astype(np.uint8)
     else:
         array = array.astype(np.float32, copy=False)
     return np.ascontiguousarray(array)

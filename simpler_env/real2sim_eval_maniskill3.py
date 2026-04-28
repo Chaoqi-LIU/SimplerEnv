@@ -10,6 +10,7 @@ from typing import Annotated, Optional
 import torch
 import tree
 from mani_skill.utils import common
+from mani_skill.utils.geometry import rotation_conversions
 from mani_skill.utils import visualization
 from mani_skill.utils.visualization.misc import images_to_video
 signal.signal(signal.SIGINT, signal.SIG_DFL) # allow ctrl+c
@@ -22,6 +23,14 @@ from mani_skill.envs.sapien_env import BaseEnv
 import tyro
 from dataclasses import dataclass
 from pathlib import Path
+
+from simpler_env.policies.praxis.bridge_state import normalize_bridge_gripper_qpos
+
+
+_BRIDGE_DATASET_TOOL_ROTATION = torch.tensor(
+    [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]],
+    dtype=torch.float32,
+)
 
 
 def _make_env(*, env_id: str, num_envs: int, shader: str) -> BaseEnv:
@@ -46,6 +55,90 @@ def _get_env_device(env) -> torch.device:
         "Environment does not expose a .device attribute on either the wrapper "
         "or env.unwrapped."
     )
+
+
+def get_bridge_state_from_maniskill3_env(env) -> torch.Tensor:
+    """Build Bridge LeRobot state: x, y, z, roll, pitch, yaw, gripper."""
+    unwrapped = getattr(env, "unwrapped", env)
+    agent = unwrapped.agent
+    controller = getattr(agent, "controller", None)
+    arm_controller = getattr(controller, "controllers", {}).get("arm")
+    if arm_controller is None or not hasattr(arm_controller, "ee_pose_at_base"):
+        raise AttributeError(
+            "Praxis Bridge observations require an arm controller with "
+            "ee_pose_at_base."
+        )
+
+    ee_pose_at_base = arm_controller.ee_pose_at_base
+    rotation = ee_pose_at_base.to_transformation_matrix()[..., :3, :3]
+    bridge_tool_rotation = _BRIDGE_DATASET_TOOL_ROTATION.to(
+        device=rotation.device,
+        dtype=rotation.dtype,
+    )
+    state_rotation = torch.matmul(rotation, bridge_tool_rotation.T)
+    euler_xyz = rotation_conversions.matrix_to_euler_angles(state_rotation, "XYZ")
+
+    qpos = common.to_tensor(agent.robot.get_qpos(), device=ee_pose_at_base.p.device)
+    if qpos.ndim == 1:
+        qpos = qpos[None, :]
+    if qpos.shape[-1] < 2:
+        raise ValueError(
+            f"Expected robot qpos to include two gripper joints, got {qpos.shape}"
+        )
+    qpos = qpos.to(dtype=ee_pose_at_base.p.dtype)
+    qlimits = common.to_tensor(agent.robot.get_qlimits(), device=qpos.device).to(
+        dtype=qpos.dtype,
+    )
+    gripper = normalize_bridge_gripper_qpos(qpos, qlimits)
+
+    return torch.cat([ee_pose_at_base.p, euler_xyz, gripper], dim=-1).to(torch.float32)
+
+
+def _mean_metric(eval_metrics, key: str) -> float:
+    values = eval_metrics.get(key)
+    if not values:
+        return 0.0
+    return float(np.mean(values))
+
+
+def _emit_progress_line(
+    *,
+    env_id: str,
+    done_count: int,
+    total_episodes: int,
+    eval_metrics,
+    loop_start_time: float,
+) -> None:
+    elapsed_s = max(0.0, float(time.time() - loop_start_time))
+    parts = [
+        "SIMPLER_EVAL",
+        f"env_id={env_id}",
+        f"done={int(done_count)}/{int(total_episodes)}",
+        f"succ_rate={100.0 * _mean_metric(eval_metrics, 'success'):.1f}%",
+        f"elapsed_s={elapsed_s:.1f}",
+    ]
+    if done_count > 0 and elapsed_s > 0:
+        parts.append(f"{elapsed_s / float(done_count):.2f}s/ep")
+    print(" ".join(parts), flush=True)
+
+
+def _video_indices_for_batch(
+    *,
+    batch_num_envs: int,
+    max_videos: int,
+    videos_saved: int,
+) -> list[int]:
+    if max_videos <= 0:
+        return list(range(int(batch_num_envs)))
+    remaining = max(0, int(max_videos) - int(videos_saved))
+    return list(range(min(int(batch_num_envs), remaining)))
+
+
+def _video_frame(image_batch, env_index: int) -> np.ndarray:
+    frame = image_batch[int(env_index)]
+    if torch.is_tensor(frame):
+        return frame.detach().cpu().numpy()
+    return np.asarray(frame)
 
 
 @dataclass
@@ -95,6 +188,12 @@ class Args:
 
     praxis_action_scale: float = 1.0
     """Action scale to apply inside the Praxis remote wrapper."""
+
+    praxis_primary_image_key: str = "observation.images.image"
+    """Primary Praxis image observation key for --model=praxis-remote."""
+
+    praxis_state_key: str = "observation.state"
+    """Praxis state observation key for --model=praxis-remote."""
 
     praxis_policy_kwargs_json: str = ""
     """Optional JSON object of kwargs to forward through Praxis remote predict_action."""
@@ -158,6 +257,8 @@ def main():
                     port=args.praxis_port,
                     policy_setup=args.praxis_policy_setup,
                     action_scale=args.praxis_action_scale,
+                    primary_image_key=args.praxis_primary_image_key,
+                    state_key=args.praxis_state_key,
                     policy_kwargs=policy_kwargs,
                 )
             elif args.model is not None:
@@ -177,6 +278,7 @@ def main():
     episode_sum_rewards: list[float] = []
     episode_max_rewards: list[float] = []
     episode_lengths: list[int] = []
+    task_descriptions_seen: list[str] = []
     sim_backend = None
     videos_saved = 0
     env: BaseEnv | None = None
@@ -191,6 +293,13 @@ def main():
 
     timers = {"env.step+inference": 0, "env.step": 0, "inference": 0, "total": 0}
     total_start_time = time.time()
+    _emit_progress_line(
+        env_id=args.env_id,
+        done_count=0,
+        total_episodes=int(args.num_episodes),
+        eval_metrics=eval_metrics,
+        loop_start_time=total_start_time,
+    )
     
     while eps_count < args.num_episodes:
         remaining_episodes = int(args.num_episodes - eps_count)
@@ -217,27 +326,62 @@ def main():
         )
         instruction = env.unwrapped.get_language_instruction()
         print("instruction:", instruction[0])
+        for value in instruction:
+            text = str(value)
+            if text not in task_descriptions_seen:
+                task_descriptions_seen.append(text)
         if model is not None:
             model.reset(instruction)
-        images = []
         predicted_terminated, truncated = False, False
-        images.append(get_image_from_maniskill3_obs_dict(env, obs))
+        current_image = get_image_from_maniskill3_obs_dict(env, obs)
+        video_indices = (
+            _video_indices_for_batch(
+                batch_num_envs=batch_num_envs,
+                max_videos=int(args.max_videos),
+                videos_saved=videos_saved,
+            )
+            if args.save_video
+            else []
+        )
+        video_frames = {
+            index: [_video_frame(current_image, index)] for index in video_indices
+        }
         elapsed_steps = 0
         sum_rewards_this_episode = np.zeros(batch_num_envs, dtype=np.float64)
         max_rewards_this_episode = np.full(batch_num_envs, -np.inf, dtype=np.float64)
         while not (predicted_terminated or truncated):
             if model is not None:
                 start_time = time.time()
-                raw_action, action = model.step(images[-1], instruction)
-                action = torch.cat([action["world_vector"], action["rot_axangle"], action["gripper"]], dim=1)
+                if args.model == "praxis-remote":
+                    state = get_bridge_state_from_maniskill3_env(env)
+                    raw_action, action = model.step(
+                        current_image,
+                        instruction,
+                        state=state,
+                    )
+                else:
+                    raw_action, action = model.step(current_image, instruction)
+                if args.model == "praxis-remote":
+                    action = torch.cat(
+                        [
+                            action["world_vector"],
+                            action["rotation_delta"],
+                            action["gripper"],
+                        ],
+                        dim=1,
+                    )
+                else:
+                    action = torch.cat(
+                        [
+                            action["world_vector"],
+                            action["rot_axangle"],
+                            action["gripper"],
+                        ],
+                        dim=1,
+                    )
                 timers["inference"] += time.time() - start_time
             else:
                 action = env.action_space.sample()
-
-            if elapsed_steps > 0:
-                if args.save_video and args.info_on_video:
-                    for i in range(len(images[-1])):
-                        images[-1][i] = visualization.put_info_on_image(images[-1][i], tree.map_structure(lambda x: x[i], info))
             
             start_time = time.time()
             obs, reward, terminated, truncated, info = env.step(action)
@@ -249,20 +393,41 @@ def main():
             info = common.to_numpy(info)
             
             truncated = bool(truncated.any()) # note that all envs truncate and terminate at the same time.
-            images.append(get_image_from_maniskill3_obs_dict(env, obs))
+            current_image = get_image_from_maniskill3_obs_dict(env, obs)
+            if video_frames:
+                for i, frames in video_frames.items():
+                    frame = _video_frame(current_image, i)
+                    if args.info_on_video:
+                        frame = visualization.put_info_on_image(
+                            frame,
+                            tree.map_structure(lambda x: x[i], info),
+                        )
+                    frames.append(frame)
 
         for k, v in info.items():
             eval_metrics[k].append(v.flatten())
         episode_sum_rewards.extend(float(value) for value in sum_rewards_this_episode)
         episode_max_rewards.extend(float(value) for value in max_rewards_this_episode)
         episode_lengths.extend([elapsed_steps] * batch_num_envs)
-        if args.save_video:
-            for i in range(len(images[-1])):
-                if args.max_videos > 0 and videos_saved >= args.max_videos:
-                    break
-                images_to_video([img[i].cpu().numpy() for img in images], exp_dir, f"{sim_backend}_eval_{seed + i}_success={info['success'][i].item()}", fps=10, verbose=True)
-                videos_saved += 1
+        for i, frames in video_frames.items():
+            if args.max_videos > 0 and videos_saved >= args.max_videos:
+                break
+            images_to_video(
+                frames,
+                exp_dir,
+                f"{sim_backend}_eval_{seed + i}_success={info['success'][i].item()}",
+                fps=10,
+                verbose=True,
+            )
+            videos_saved += 1
         eps_count += batch_num_envs
+        _emit_progress_line(
+            env_id=args.env_id,
+            done_count=eps_count,
+            total_episodes=int(args.num_episodes),
+            eval_metrics=eval_metrics,
+            loop_start_time=total_start_time,
+        )
         if batch_num_envs == 1:
             print(f"Evaluated episode {eps_count}. Seed {seed}. Results after {eps_count} episodes:")
         else:
@@ -280,6 +445,9 @@ def main():
     mean_metrics["avg_reward"] = float(np.mean(episode_sum_rewards)) if episode_sum_rewards else 0.0
     mean_metrics["avg_sum_reward"] = mean_metrics["avg_reward"]
     mean_metrics["avg_max_reward"] = float(np.mean(episode_max_rewards)) if episode_max_rewards else 0.0
+    if task_descriptions_seen:
+        mean_metrics["task_description"] = task_descriptions_seen[0]
+        mean_metrics["task_descriptions"] = task_descriptions_seen
     mean_metrics["eval_s"] = float(timers["total"])
     mean_metrics["eval_ep_s"] = float(timers["total"]) / max(1, eps_count)
     mean_metrics["time/episodes_per_second"] = eps_count / timers["total"]

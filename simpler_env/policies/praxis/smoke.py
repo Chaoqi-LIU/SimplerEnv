@@ -53,7 +53,7 @@ def main() -> None:
     print("action keys:", sorted(action.keys()))
     print("raw action:", np.asarray(raw_action["action"]).tolist())
     print("world_vector:", np.asarray(action["world_vector"]).tolist())
-    print("rot_axangle:", np.asarray(action["rot_axangle"]).tolist())
+    print("rotation_delta:", np.asarray(action["rotation_delta"]).tolist())
     print("gripper:", np.asarray(action["gripper"]).tolist())
     print("terminate_episode:", np.asarray(action["terminate_episode"]).tolist())
 
