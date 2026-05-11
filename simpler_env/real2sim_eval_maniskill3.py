@@ -98,7 +98,14 @@ def _mean_metric(eval_metrics, key: str) -> float:
     values = eval_metrics.get(key)
     if not values:
         return 0.0
-    return float(np.mean(values))
+    return float(np.mean(_flatten_metric_values(values)))
+
+
+def _flatten_metric_values(values) -> np.ndarray:
+    arrays = [np.asarray(value).reshape(-1) for value in values]
+    if not arrays:
+        return np.asarray([], dtype=np.float64)
+    return np.concatenate(arrays).astype(np.float64, copy=False)
 
 
 def _emit_progress_line(
@@ -433,14 +440,16 @@ def main():
         else:
             print(f"Evaluated {batch_num_envs} episodes, seeds {seed} to {eps_count}. Results after {eps_count} episodes:")
         for k, v in eval_metrics.items():
-            print(f"{k}: {np.mean(v)}")
+            print(f"{k}: {np.mean(_flatten_metric_values(v))}")
     # Print timing information
     timers["total"] = time.time() - total_start_time
     timers["env.step+inference"] = timers["env.step"] + timers["inference"]
-    mean_metrics = {k: np.mean(v) for k, v in eval_metrics.items()}
+    mean_metrics = {
+        k: float(np.mean(_flatten_metric_values(v))) for k, v in eval_metrics.items()
+    }
     mean_metrics["n_episodes"] = int(eps_count)
     mean_metrics["total_episodes"] = int(eps_count)
-    mean_metrics["success_rate"] = float(np.mean(eval_metrics["success"])) if "success" in eval_metrics else 0.0
+    mean_metrics["success_rate"] = _mean_metric(eval_metrics, "success")
     mean_metrics["avg_episode_length"] = float(np.mean(episode_lengths)) if episode_lengths else 0.0
     mean_metrics["avg_reward"] = float(np.mean(episode_sum_rewards)) if episode_sum_rewards else 0.0
     mean_metrics["avg_sum_reward"] = mean_metrics["avg_reward"]
