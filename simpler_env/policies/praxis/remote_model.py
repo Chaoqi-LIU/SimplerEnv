@@ -22,18 +22,18 @@ class PraxisRemoteInference:
         port: int = 50051,
         policy_setup: str = "widowx_bridge",
         action_scale: float = 1.0,
-        primary_image_key: str = "observation.images.primary",
+        primary_image_key: str = "observation.images.image",
         additional_image_keys: Mapping[str, str] | None = None,
         state_key: str = "observation.state",
         task_key: str = "task",
         policy_kwargs: Mapping[str, Any] | None = None,
     ) -> None:
         try:
-            from praxis_client import PolicyClient
+            from praxis_remote import PolicyClient
         except ImportError as exc:  # pragma: no cover - import failure is user setup.
             raise ImportError(
-                "PraxisRemoteInference requires praxis_client to be importable. "
-                "Install the Praxis client package before using this wrapper."
+                "PraxisRemoteInference requires praxis_remote to be importable. "
+                "Install the praxis-remote package before using this wrapper."
             ) from exc
 
         self.client = PolicyClient(host=host, port=int(port))
