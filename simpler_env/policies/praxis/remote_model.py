@@ -97,7 +97,7 @@ class PraxisRemoteInference:
         if policy_kwargs is not None:
             request_kwargs.update(policy_kwargs)
         action = np.asarray(
-            self.client.predict_observations(
+            self.client.predict_action(
                 observations,
                 policy_kwargs=request_kwargs,
             ),
