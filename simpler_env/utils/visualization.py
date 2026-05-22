@@ -9,7 +9,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from scipy.ndimage import binary_dilation
 
-FONT_PATH = str(Path(__file__) / "fonts/UbuntuMono-R.ttf")
+FONT_PATH = str(Path(__file__).with_name("fonts") / "UbuntuMono-R.ttf")
 
 _rng = np.random.RandomState(0)
 _palette = ((_rng.random((3 * 255)) * 0.7 + 0.3) * 255).astype(np.uint8).tolist()
