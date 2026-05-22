@@ -6,7 +6,7 @@ README = Path(__file__).with_name("README.md").read_text(encoding="utf-8")
 
 setup(
     name="praxis-simpler",
-    version="0.0.1",
+    version="0.0.1.post1",
     author="Xuanlin Li",
     maintainer="Chaoqi Liu",
     maintainer_email="liuchaoqi730@gmail.com",
@@ -18,6 +18,7 @@ setup(
         "Maintainer Website": "https://chaoqi-liu.com",
     },
     packages=find_packages(include=["simpler_env*"]),
+    package_data={"simpler_env": ["praxis_conda_env.yaml"]},
     python_requires=">=3.10",
     install_requires=[
         "dm-tree",

@@ -1,0 +1,11 @@
+name: simpler-praxis
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.10.12
+  - pip
+  - git
+  - pip:
+      - torch==2.3.1
+      - git+https://github.com/haosulab/ManiSkill.git
